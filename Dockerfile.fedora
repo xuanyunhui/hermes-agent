@@ -92,7 +92,7 @@ RUN npm install --prefer-offline --no-audit && \
 # on the specific `--extra` set chosen. Same logic applies here.
 COPY pyproject.toml uv.lock ./
 RUN touch ./README.md
-RUN uv sync --frozen --no-install-project --extra all --extra messaging
+RUN uv sync --frozen --no-install-project --extra all --extra messaging --extra anthropic
 
 # ---------- Source code ----------
 COPY --chown=hermes:hermes . .
