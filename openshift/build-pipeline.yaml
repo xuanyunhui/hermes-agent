@@ -1,0 +1,119 @@
+# OpenShift Pipelines (Tekton) build for hermes-agent.
+#
+# What this defines:
+#   - ImageStream    target for the built image (in-cluster registry path)
+#   - PVC            shared workspace between git-clone and buildah
+#   - Pipeline       git-clone -> buildah (Dockerfile.fedora)
+#
+# Apply:
+#   oc apply -f openshift/build-pipeline.yaml -n hermes-agent
+#
+# One-time grant so the default `pipeline` SA can push to the internal registry:
+#   oc policy add-role-to-user system:image-builder \
+#     system:serviceaccount:hermes-agent:pipeline -n hermes-agent
+#
+# Trigger a run with openshift/build-pipelinerun.yaml.
+
+---
+apiVersion: image.openshift.io/v1
+kind: ImageStream
+metadata:
+  name: hermes-agent
+  namespace: hermes-agent
+spec:
+  lookupPolicy:
+    local: true
+
+---
+# Workspace volume shared by git-clone (writer) and buildah (reader/builder).
+# 20Gi because the build pulls Playwright chromium, full npm trees for web +
+# ui-tui, and the uv-resolved Python venv. 10Gi has been observed to fill on
+# warm rebuilds where the buildah overlay cache grows.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: hermes-agent-build-workspace
+  namespace: hermes-agent
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: hermes-agent-build
+  namespace: hermes-agent
+spec:
+  params:
+    - name: git-url
+      type: string
+      default: https://github.com/xuanyunhui/hermes-agent.git
+    - name: git-revision
+      type: string
+      default: self-hosted-dev
+    - name: image
+      type: string
+      description: Fully-qualified image ref to push (registry/namespace/name:tag).
+      default: image-registry.openshift-image-registry.svc:5000/hermes-agent/hermes-agent:latest
+    - name: dockerfile
+      type: string
+      default: Dockerfile.fedora
+    - name: context
+      type: string
+      default: .
+
+  workspaces:
+    - name: source
+
+  tasks:
+    - name: fetch-source
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: git-clone
+          - name: namespace
+            value: openshift-pipelines
+      params:
+        - name: URL
+          value: $(params.git-url)
+        - name: REVISION
+          value: $(params.git-revision)
+        - name: DELETE_EXISTING
+          value: "true"
+      workspaces:
+        - name: output
+          workspace: source
+
+    - name: build-and-push
+      runAfter: [fetch-source]
+      taskRef:
+        resolver: cluster
+        params:
+          - name: kind
+            value: task
+          - name: name
+            value: buildah
+          - name: namespace
+            value: openshift-pipelines
+      params:
+        - name: IMAGE
+          value: $(params.image)
+        - name: DOCKERFILE
+          value: $(params.dockerfile)
+        - name: CONTEXT
+          value: $(params.context)
+        # Internal registry serves a service-CA-signed cert that the buildah
+        # task trusts out of the box on OpenShift — TLS verify stays on.
+        - name: TLS_VERIFY
+          value: "true"
+        - name: STORAGE_DRIVER
+          value: vfs
+      workspaces:
+        - name: source
+          workspace: source

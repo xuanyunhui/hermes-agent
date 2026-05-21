@@ -1,0 +1,46 @@
+# One-shot trigger for the hermes-agent-build Pipeline.
+#
+# Run:
+#   oc create -f openshift/build-pipelinerun.yaml -n hermes-agent
+#
+# `generateName` (not `name`) lets you create successive runs without
+# manually bumping the suffix — each `oc create` produces a fresh run.
+#
+# Watch progress:
+#   tkn pipelinerun logs -L -f -n hermes-agent
+#   # or
+#   oc get pipelinerun -n hermes-agent -w
+
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: hermes-agent-build-
+  namespace: hermes-agent
+spec:
+  pipelineRef:
+    name: hermes-agent-build
+
+  # Stops a hung Playwright / npm install from sitting forever on the PVC.
+  # The cold build (chromium + uv sync + web/ui-tui builds) typically runs
+  # 15–25 min on modest worker nodes; 2h leaves comfortable margin.
+  timeouts:
+    pipeline: 2h
+
+  # Service account that buildah uses to push to the in-cluster registry.
+  # Needs the system:image-builder role granted to it (see build-pipeline.yaml
+  # header). The default `pipeline` SA is created by the Pipelines operator.
+  taskRunTemplate:
+    serviceAccountName: pipeline
+
+  params:
+    # Override any of these inline with --param when running via `tkn`, e.g.:
+    #   tkn pipeline start hermes-agent-build \
+    #     -p git-revision=main -p image=...:my-tag \
+    #     -w name=source,claimName=hermes-agent-build-workspace
+    - name: git-revision
+      value: self-hosted-dev
+
+  workspaces:
+    - name: source
+      persistentVolumeClaim:
+        claimName: hermes-agent-build-workspace

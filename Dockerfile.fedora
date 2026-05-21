@@ -1,0 +1,119 @@
+# Fedora variant of the production Dockerfile.
+#
+# Why a separate file:
+#   - Fedora packages uv, ripgrep, ffmpeg-free, tini, and sudo in its main
+#     repos, so the whole image installs via dnf — no upstream static
+#     binary fetches like the Debian Dockerfile does for gosu/uv.
+#   - sudo stands in for gosu via a tiny shim at /usr/local/bin/gosu, so
+#     docker/entrypoint.sh stays unchanged across all image variants.
+#   - Playwright's `--with-deps chromium` flag only knows apt-based distros,
+#     so chromium's runtime libraries are listed explicitly via dnf.
+
+FROM fedora:42
+
+ENV PYTHONUNBUFFERED=1
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
+
+# ---------- System packages ----------
+# nodejs/npm: Fedora 42 ships Node.js 22 (LTS) in the default repos.
+# python3 is 3.13 on Fedora 42, which satisfies pyproject.toml >=3.11.
+# uv, ripgrep, ffmpeg-free, tini, sudo are all in main Fedora repos.
+# Playwright chromium (--only-shell) runtime libs need the alsa/atk/cups/
+# gtk/X11 family — without them headless-shell exits with "error while
+# loading shared libraries" on first launch.
+RUN dnf -y --setopt=install_weak_deps=False install \
+        python3 python3-devel python3-pip \
+        nodejs npm \
+        uv \
+        gcc gcc-c++ make \
+        git openssh-clients \
+        procps-ng \
+        libffi-devel \
+        tini sudo \
+        ripgrep ffmpeg-free \
+        ca-certificates \
+        liberation-fonts \
+        alsa-lib atk at-spi2-atk at-spi2-core \
+        cairo cups-libs dbus-libs expat \
+        gdk-pixbuf2 glib2 gtk3 \
+        libdrm libxkbcommon libxshmfence mesa-libgbm \
+        nspr nss pango \
+        libX11 libxcb libXcomposite libXcursor libXdamage \
+        libXext libXfixes libXi libXrandr libXScrnSaver libXtst \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# ---------- gosu shim backed by sudo ----------
+# docker/entrypoint.sh invokes `exec gosu hermes "$0" "$@"` to drop root.
+# Fedora has no gosu package, so a one-line wrapper translates the gosu
+# CLI (`gosu USER CMD [ARGS...]`) into `sudo -E -H -u USER -- CMD ...`.
+# Running this from uid=0 needs no sudoers config — sudo skips auth when
+# the invoker is already root. -E preserves the env so HERMES_*/provider
+# keys cross the privilege drop. The shim has no `set -e`; we rely on
+# exec replacing the shell so any non-zero exit propagates directly.
+RUN printf '%s\n' \
+        '#!/bin/sh' \
+        '# gosu(1) compatibility shim — drops privileges via sudo.' \
+        'user="$1"; shift' \
+        'exec sudo -E -H -u "$user" -- "$@"' \
+        > /usr/local/bin/gosu \
+    && chmod 0755 /usr/local/bin/gosu
+
+# ---------- Non-root user ----------
+# UID 10000 matches Dockerfile so /opt/data volume metadata stays compatible
+# when users switch images. HERMES_UID at runtime can still override this.
+RUN useradd -u 10000 -m -d /opt/data hermes
+
+WORKDIR /opt/hermes
+
+# ---------- Layer-cached npm install + Playwright ----------
+# Mirror Dockerfile: copy package manifests (and the hermes-ink workspace
+# tree, since it's a `file:` dep) first so a source-only change doesn't
+# invalidate the ~minutes-long npm + chromium download layer.
+COPY package.json package-lock.json ./
+COPY web/package.json web/package-lock.json web/
+COPY ui-tui/package.json ui-tui/package-lock.json ui-tui/
+COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
+
+# See Dockerfile comment: install-links=false forces symlink installs
+# so the host-generated lockfile (newer npm) matches container behavior.
+ENV npm_config_install_links=false
+
+# `--with-deps` would call apt-get; omit it on Fedora and rely on the dnf
+# install above for chromium's runtime libraries.
+RUN npm install --prefer-offline --no-audit && \
+    npx playwright install chromium --only-shell && \
+    (cd web    && npm install --prefer-offline --no-audit) && \
+    (cd ui-tui && npm install --prefer-offline --no-audit) && \
+    npm cache clean --force
+
+# ---------- Layer-cached Python dependency install ----------
+# See Dockerfile for rationale on splitting this from the source copy and
+# on the specific `--extra` set chosen. Same logic applies here.
+COPY pyproject.toml uv.lock ./
+RUN touch ./README.md
+RUN uv sync --frozen --no-install-project --extra all --extra messaging
+
+# ---------- Source code ----------
+COPY --chown=hermes:hermes . .
+
+RUN cd web && npm run build && \
+    cd ../ui-tui && npm run build
+
+# ---------- Permissions ----------
+# See Dockerfile: world-readable install dir; hermes-writable .venv,
+# ui-tui, and node_modules so lazy_deps + runtime npm install can write.
+USER root
+RUN chmod -R a+rX /opt/hermes && \
+    chown -R hermes:hermes /opt/hermes/.venv /opt/hermes/ui-tui /opt/hermes/node_modules
+
+# ---------- Link hermes-agent itself (editable) ----------
+RUN uv pip install --no-cache-dir --no-deps -e "."
+
+# ---------- Runtime ----------
+ENV HERMES_WEB_DIST=/opt/hermes/hermes_cli/web_dist
+ENV HERMES_HOME=/opt/data
+ENV PATH="/opt/data/.local/bin:${PATH}"
+RUN mkdir -p /opt/data
+VOLUME [ "/opt/data" ]
+ENTRYPOINT [ "/usr/bin/tini", "-g", "--", "/opt/hermes/docker/entrypoint.sh" ]
