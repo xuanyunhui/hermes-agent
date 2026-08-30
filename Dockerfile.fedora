@@ -9,20 +9,32 @@
 #   - Playwright's `--with-deps chromium` flag only knows apt-based distros,
 #     so chromium's runtime libraries are listed explicitly via dnf.
 
-FROM fedora:42
+FROM fedora:45
 
 ENV PYTHONUNBUFFERED=1
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/hermes/.playwright
 
 # ---------- System packages ----------
-# nodejs/npm: Fedora 42 ships Node.js 22 (LTS) in the default repos.
-# python3 is 3.13 on Fedora 42, which satisfies pyproject.toml >=3.11.
-# uv, ripgrep, ffmpeg-free, tini, sudo are all in main Fedora repos.
-# Playwright chromium (--only-shell) runtime libs need the alsa/atk/cups/
-# gtk/X11 family — without them headless-shell exits with "error while
-# loading shared libraries" on first launch.
+# Base is fedora:45 (not 42) for sqlite-libs 3.53.4. Fedora 42/43/44 ship
+# 3.47.2/3.50.2/3.51.2, all of which hermes_cli.sqlite_runtime's
+# is_sqlite_wal_reset_vulnerable() flags as carrying the SQLite WAL-reset
+# corruption bug; the upstream Dockerfile compiles 3.53.4 from source for
+# exactly this reason (see its sqlite_build stage). Fedora 45 packages that
+# same version, so dnf covers it and no build stage is needed.
+#
+# python3.13 (NOT python3): fedora:45's unversioned python3 is 3.15.0~rc1,
+# which violates pyproject.toml requires-python = ">=3.11,<3.14". The
+# versioned package pins 3.13.15 and links the system libsqlite3, so the
+# interpreter actually picks up 3.53.4. There is no python3.13-pip
+# subpackage on Fedora — ensurepip covers it and uv does the rest.
+#
+# nodejs/npm: Fedora 45 ships Node.js 22.23.1, satisfying package.json
+# engines ">=22.22.0". uv, ripgrep, ffmpeg-free, tini, sudo are all in main
+# Fedora repos. Playwright chromium (--only-shell) runtime libs need the
+# alsa/atk/cups/gtk/X11 family — without them headless-shell exits with
+# "error while loading shared libraries" on first launch.
 RUN dnf -y --setopt=install_weak_deps=False install \
-        python3 python3-devel python3-pip \
+        python3.13 python3.13-devel \
         nodejs npm \
         uv \
         gcc gcc-c++ make \
@@ -42,6 +54,17 @@ RUN dnf -y --setopt=install_weak_deps=False install \
         libXext libXfixes libXi libXrandr libXScrnSaver libXtst \
     && dnf clean all \
     && rm -rf /var/cache/dnf
+
+# ---------- python3 -> python3.13 ----------
+# Installing only the versioned package leaves no /usr/bin/python3, so any
+# `python3` shebang or subprocess call would fail. Point it at 3.13 rather
+# than pulling in the python3 package, which would install 3.15.0~rc1.
+# UV_PYTHON pins uv to this interpreter so it never downloads a managed
+# build — those bundle their own libsqlite3 and would silently reintroduce
+# the vulnerable SQLite this base image was chosen to avoid.
+RUN ln -sf /usr/bin/python3.13 /usr/bin/python3
+ENV UV_PYTHON=/usr/bin/python3.13
+ENV UV_PYTHON_DOWNLOADS=never
 
 # ---------- gosu shim backed by sudo ----------
 # docker/entrypoint.sh invokes `exec gosu hermes "$0" "$@"` to drop root.
@@ -70,10 +93,16 @@ WORKDIR /opt/hermes
 # Mirror Dockerfile: copy package manifests (and the hermes-ink workspace
 # tree, since it's a `file:` dep) first so a source-only change doesn't
 # invalidate the ~minutes-long npm + chromium download layer.
+# web/ and ui-tui/ no longer carry their own package-lock.json — upstream
+# consolidated them into npm workspaces behind the single root lockfile, so
+# the root `npm install` now installs every workspace and the old per-directory
+# installs are gone. apps/shared is a workspace member too and must be present
+# for the root install to resolve.
 COPY package.json package-lock.json ./
-COPY web/package.json web/package-lock.json web/
-COPY ui-tui/package.json ui-tui/package-lock.json ui-tui/
+COPY web/package.json web/
+COPY ui-tui/package.json ui-tui/
 COPY ui-tui/packages/hermes-ink/ ui-tui/packages/hermes-ink/
+COPY apps/shared/ apps/shared/
 
 # See Dockerfile comment: install-links=false forces symlink installs
 # so the host-generated lockfile (newer npm) matches container behavior.
@@ -81,10 +110,8 @@ ENV npm_config_install_links=false
 
 # `--with-deps` would call apt-get; omit it on Fedora and rely on the dnf
 # install above for chromium's runtime libraries.
-RUN npm install --prefer-offline --no-audit && \
+RUN npm install --prefer-offline --no-audit --fetch-retries=5 && \
     npx playwright install chromium --only-shell && \
-    (cd web    && npm install --prefer-offline --no-audit) && \
-    (cd ui-tui && npm install --prefer-offline --no-audit) && \
     npm cache clean --force
 
 # ---------- Layer-cached Python dependency install ----------
